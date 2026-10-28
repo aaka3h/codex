@@ -36,6 +36,7 @@ const CURATED_PLUGINS_BACKUP_ARCHIVE_FALLBACK_VERSION: &str = "export-backup";
 const CURATED_PLUGINS_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const CURATED_PLUGINS_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const CURATED_PLUGINS_BACKUP_ARCHIVE_TIMEOUT: Duration = Duration::from_secs(30);
+const CURATED_PLUGINS_MAX_EXTRACTED_BYTES: u64 = 512 * 1024 * 1024;
 // Keep this comfortably above a normal sync attempt so we do not race another Codex process.
 const CURATED_PLUGINS_STALE_TEMP_DIR_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 #[derive(Debug, Deserialize)]
@@ -330,7 +331,11 @@ fn sync_openai_plugins_repo_via_http(
         api_base_url,
         &remote_sha,
     ))?;
-    extract_zipball_to_dir(&zipball_bytes, staged_repo_dir.path())?;
+    extract_zipball_to_dir(
+        &zipball_bytes,
+        staged_repo_dir.path(),
+        CURATED_PLUGINS_MAX_EXTRACTED_BYTES,
+    )?;
     ensure_marketplace_manifest_exists(staged_repo_dir.path())?;
     activate_curated_repo(&repo_path, staged_repo_dir)?;
     write_curated_plugins_sha(&sha_path, &remote_sha)?;
@@ -354,7 +359,11 @@ fn sync_openai_plugins_repo_via_backup_archive(
         &http_clients,
         backup_archive_api_url,
     ))?;
-    extract_zipball_to_dir(&zipball_bytes, staged_repo_dir.path())?;
+    extract_zipball_to_dir(
+        &zipball_bytes,
+        staged_repo_dir.path(),
+        CURATED_PLUGINS_MAX_EXTRACTED_BYTES,
+    )?;
     ensure_marketplace_manifest_exists(staged_repo_dir.path())?;
     let export_version = read_extracted_backup_archive_git_sha(staged_repo_dir.path())?
         .unwrap_or_else(|| CURATED_PLUGINS_BACKUP_ARCHIVE_FALLBACK_VERSION.to_string());
@@ -1030,7 +1039,11 @@ fn read_sha_file(sha_path: &Path) -> Option<String> {
         .filter(|sha| !sha.is_empty())
 }
 
-fn extract_zipball_to_dir(bytes: &[u8], destination: &Path) -> Result<(), String> {
+fn extract_zipball_to_dir(
+    bytes: &[u8],
+    destination: &Path,
+    max_total_bytes: u64,
+) -> Result<(), String> {
     std::fs::create_dir_all(destination).map_err(|err| {
         format!(
             "failed to create curated plugins extraction directory {}: {err}",
@@ -1041,6 +1054,7 @@ fn extract_zipball_to_dir(bytes: &[u8], destination: &Path) -> Result<(), String
     let cursor = std::io::Cursor::new(bytes);
     let mut archive = ZipArchive::new(cursor)
         .map_err(|err| format!("failed to open curated plugins zip archive: {err}"))?;
+    let mut extracted_bytes = 0u64;
 
     for index in 0..archive.len() {
         let mut entry = archive
@@ -1080,6 +1094,18 @@ fn extract_zipball_to_dir(bytes: &[u8], destination: &Path) -> Result<(), String
             })?;
             continue;
         }
+
+        let next_total = extracted_bytes.checked_add(entry.size()).ok_or_else(|| {
+            format!(
+                "curated plugins zip archive exceeds extracted-size limit of {max_total_bytes} bytes"
+            )
+        })?;
+        if next_total > max_total_bytes {
+            return Err(format!(
+                "curated plugins zip archive exceeds extracted-size limit of {max_total_bytes} bytes"
+            ));
+        }
+        extracted_bytes = next_total;
 
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent).map_err(|err| {
