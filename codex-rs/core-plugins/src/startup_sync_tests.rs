@@ -1247,7 +1247,12 @@ fn extract_zipball_preserves_only_unix_access_permissions() {
         .expect("add script");
     let bytes = archive.finish().expect("finish archive").into_inner();
 
-    extract_zipball_to_dir(&bytes, destination.path()).expect("extract archive");
+    extract_zipball_to_dir(
+        &bytes,
+        destination.path(),
+        CURATED_PLUGINS_MAX_EXTRACTED_BYTES,
+    )
+    .expect("extract archive");
 
     let script = std::fs::metadata(destination.path().join("script")).expect("script metadata");
     assert_eq!(script.permissions().mode() & 0o7777, 0o755);
@@ -1484,4 +1489,56 @@ fn curated_repo_backup_archive_zip_bytes(sha: &str) -> Vec<u8> {
         .expect("write plugin manifest");
 
     writer.finish().expect("finish zip writer").into_inner()
+}
+
+fn compressed_zipball_with_two_files() -> Vec<u8> {
+    let cursor = std::io::Cursor::new(Vec::new());
+    let mut writer = ZipWriter::new(cursor);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let data = vec![0u8; 1024 * 1024];
+    for index in 0..2 {
+        writer
+            .start_file(format!("repo/file-{index}.bin"), options)
+            .expect("start zip entry");
+        writer.write_all(&data).expect("write zip entry");
+    }
+    writer.finish().expect("finish zip writer").into_inner()
+}
+
+#[test]
+fn extract_zipball_rejects_entries_over_aggregate_size_limit() {
+    let destination = tempdir().expect("tempdir");
+    let bytes = compressed_zipball_with_two_files();
+    let max_total_bytes = 1024 * 1024;
+
+    let err = extract_zipball_to_dir(&bytes, destination.path(), max_total_bytes)
+        .expect_err("second entry should exceed the extracted-size limit");
+
+    assert!(err.contains("extracted-size limit of 1048576 bytes"));
+    assert_eq!(
+        std::fs::metadata(destination.path().join("file-0.bin"))
+            .expect("first entry was extracted")
+            .len(),
+        max_total_bytes
+    );
+    assert!(!destination.path().join("file-1.bin").exists());
+}
+
+#[test]
+fn extract_zipball_accepts_entries_at_aggregate_size_limit() {
+    let destination = tempdir().expect("tempdir");
+    let bytes = compressed_zipball_with_two_files();
+    let max_total_bytes = 2 * 1024 * 1024;
+
+    extract_zipball_to_dir(&bytes, destination.path(), max_total_bytes)
+        .expect("archive at the limit should extract");
+
+    for index in 0..2 {
+        assert_eq!(
+            std::fs::metadata(destination.path().join(format!("file-{index}.bin")))
+                .expect("entry was extracted")
+                .len(),
+            1024 * 1024
+        );
+    }
 }
